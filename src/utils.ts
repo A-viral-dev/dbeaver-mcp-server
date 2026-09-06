@@ -65,6 +65,11 @@ export function validateQuery(query: string): string | null {
     return 'Query cannot be empty';
   }
 
+  // Block CLI dot-commands immediately (.shell, .system, .read, etc.)
+  if (/^\s*\.[a-zA-Z]/m.test(query)) {
+    return 'Database CLI dot-commands (.shell, .system, .read, etc.) are strictly prohibited.';
+  }
+
   // Strip leading comments (block and line) so they can't hide the real statement
   let stripped = query.trim();
   while (true) {
@@ -105,14 +110,23 @@ export function validateQuery(query: string): string | null {
            'INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, and other write operations are blocked.';
   }
 
-  // Additional safety: block dangerous patterns even inside SELECT (e.g. subquery tricks)
+  // Strictly disallow multi-statement queries to prevent injection & write chaining.
+  // Allow optional trailing semicolon(s), but no intermediate semicolons.
+  const withoutTrailingSemicolons = stripped.replace(/;+\s*$/, '').trim();
+  if (withoutTrailingSemicolons.includes(';')) {
+    return 'Multi-statement queries (separated by semicolons) are strictly prohibited for security.';
+  }
+
+  // Additional safety: block destructive administrative commands
   const dangerousPatterns = [
-    /;\s*(insert|update|delete|drop|create|alter|truncate|grant|revoke|shutdown|restart)\b/i,
+    /\b(into\s+outfile|into\s+dumpfile)\b/i,
+    /\b(pg_terminate_backend|pg_cancel_backend)\b/i,
+    /\b(dblink_connect|dblink_exec)\b/i,
   ];
 
   for (const pattern of dangerousPatterns) {
     if (pattern.test(stripped)) {
-      return 'Multi-statement queries containing write operations are not allowed.';
+      return `Potentially harmful administrative function detected and blocked: ${pattern}`;
     }
   }
 
@@ -187,6 +201,8 @@ export function getTestQuery(driver: string): string {
   
   if (driverLower.includes('postgresql') || driverLower.includes('postgres')) {
     return 'SELECT version();';
+  } else if (driverLower.includes('duckdb')) {
+    return 'SELECT version();';
   } else if (driverLower.includes('mysql')) {
     return 'SELECT version();';
   } else if (driverLower.includes('oracle')) {
@@ -212,7 +228,7 @@ export function buildSchemaQuery(driver: string, tableName: string): string {
   const safeTableName = sanitizeIdentifier(tableName);
   const driverLower = driver.toLowerCase();
   
-  if (driverLower.includes('postgresql') || driverLower.includes('postgres')) {
+  if (driverLower.includes('postgresql') || driverLower.includes('postgres') || driverLower.includes('duckdb')) {
     return `
       SELECT 
         column_name,
@@ -293,7 +309,7 @@ export function buildListTablesQuery(driver: string, schema?: string, includeVie
   const safeSchema = schema ? sanitizeIdentifier(schema) : undefined;
   const driverLower = driver.toLowerCase();
   
-  if (driverLower.includes('postgresql') || driverLower.includes('postgres')) {
+  if (driverLower.includes('postgresql') || driverLower.includes('postgres') || driverLower.includes('duckdb')) {
     let query = `
       SELECT 
         table_name,

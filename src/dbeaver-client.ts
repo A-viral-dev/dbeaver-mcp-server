@@ -115,12 +115,163 @@ export class DBeaverClient {
     
     if (driver.includes('sqlite')) {
       return this.executeSQLiteQuery(connection, query);
+    } else if (driver.includes('quack') || connection.url?.includes('quack:') || (connection.database && connection.database.startsWith('quack:'))) {
+      return this.executeQuackConnection(connection, query);
+    } else if (driver.includes('duckdb')) {
+      return this.executeDuckDBQuery(connection, query);
     } else if (driver.includes('postgres')) {
       return this.executePostgreSQLQuery(connection, query);
     } else {
       // For unsupported drivers, return a helpful error instead of crashing
-      throw new Error(`Database driver "${driver}" is not yet supported for direct query execution. Supported drivers: SQLite, PostgreSQL. Please use DBeaver GUI for this connection type.`);
+      throw new Error(`Database driver "${driver}" is not yet supported for direct query execution. Supported drivers: SQLite, DuckDB, Quack, PostgreSQL. Please use DBeaver GUI for this connection type.`);
     }
+  }
+
+  private async executeQuackConnection(connection: DBeaverConnection, query: string): Promise<QueryResult> {
+    const rawUri = connection.properties?.['quack.url'] || connection.database || connection.url || '';
+    const cleanUri = rawUri.replace(/^jdbc:duckdb:/, '').replace(/^jdbc:/, '');
+    const token = connection.properties?.['quack.token'] || connection.properties?.token || connection.properties?.password || '';
+    return this.executeQuackQuery(cleanUri, token, query);
+  }
+
+  private async executeQuackQuery(quackUri: string, token: string, query: string): Promise<QueryResult> {
+    return new Promise((resolve, reject) => {
+      const cleanQuery = query.trim().replace(/;+$/, '');
+      let script = 'LOAD quack;\n';
+      if (token) {
+        script += `CREATE SECRET (TYPE quack, TOKEN '${token}');\n`;
+      }
+      script += `ATTACH '${quackUri}' AS remote_q (READ_ONLY);\n`;
+      script += `USE remote_q;\n`;
+      script += `${cleanQuery};\n`;
+
+      const proc = spawn('duckdb', ['-json'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      let output = '';
+      let error = '';
+
+      proc.stdout.on('data', (d) => { output += d.toString(); });
+      proc.stderr.on('data', (d) => { error += d.toString(); });
+
+      proc.on('close', (code) => {
+        if (code !== 0) {
+          reject(new Error(`Quack error: ${error.trim()}`));
+          return;
+        }
+
+        try {
+          const trimmed = output.trim();
+          if (!trimmed || trimmed === '[]') {
+            resolve({ columns: [], rows: [], rowCount: 0, executionTime: 0 });
+            return;
+          }
+          // The output might include multiple JSON blocks (e.g. from CREATE SECRET / ATTACH).
+          // Match and parse the last JSON array block.
+          const matches = trimmed.match(/\[[\s\S]*?\]/g);
+          const lastJson = matches ? matches[matches.length - 1] : trimmed;
+          const parsed = JSON.parse(lastJson);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const columns = Object.keys(parsed[0]);
+            const rows = parsed.map((item: any) => columns.map(col => String(item[col] ?? '')));
+            resolve({ columns, rows, rowCount: rows.length, executionTime: 0 });
+          } else {
+            resolve({ columns: [], rows: [], rowCount: 0, executionTime: 0 });
+          }
+        } catch (err) {
+          reject(new Error(`Failed to parse Quack JSON output: ${err}`));
+        }
+      });
+
+      proc.stdin.write(script);
+      proc.stdin.end();
+    });
+  }
+
+  private async executeDuckDBQuery(connection: DBeaverConnection, query: string): Promise<QueryResult> {
+    const dbPath = connection.properties?.database || connection.database;
+    if (!dbPath) {
+      throw new Error('DuckDB database path not found');
+    }
+
+    // Check if a Quack endpoint is explicitly configured in connection properties
+    const quackUrl = connection.properties?.['quack.url'];
+    if (quackUrl) {
+      const token = connection.properties?.['quack.token'] || connection.properties?.token || connection.properties?.password || '';
+      return this.executeQuackQuery(quackUrl, token, query);
+    }
+
+    return new Promise((resolve, reject) => {
+      // Always enforce -readonly and -json
+      const proc = spawn('duckdb', ['-readonly', '-json', dbPath, query], { stdio: ['pipe', 'pipe', 'pipe'] });
+      
+      let output = '';
+      let error = '';
+      
+      proc.stdout.on('data', (data) => {
+        output += data.toString();
+      });
+      
+      proc.stderr.on('data', (data) => {
+        error += data.toString();
+      });
+      
+      proc.on('close', async (code) => {
+        if (code !== 0) {
+          if (
+            error.includes('used by another process') ||
+            error.includes('Conflicting lock') ||
+            error.includes('Cannot open file') ||
+            error.includes('File is already open')
+          ) {
+            // Check if Quack server is running locally on 127.0.0.1:9999 or custom port
+            const fallbackPort = connection.properties?.['quack.port'] || '9999';
+            const fallbackToken = connection.properties?.['quack.token'] || connection.properties?.token || process.env.QUACK_TOKEN || '';
+
+            if (fallbackToken) {
+              try {
+                const quackResult = await this.executeQuackQuery(`quack:127.0.0.1:${fallbackPort}`, fallbackToken, query);
+                resolve(quackResult);
+                return;
+              } catch (quackErr: any) {
+                reject(new Error(`Quack error on port ${fallbackPort}: ${quackErr.message || String(quackErr)}`));
+                return;
+              }
+            }
+
+            reject(new Error(
+              `DuckDB Lock Conflict: The database file is currently opened exclusively by DBeaver (or another process) with a write lock.\n\n` +
+              `To resolve this, choose one of these options:\n\n` +
+              `▶ OPTION 1: Quack Server (Live Concurrency):\n` +
+              `   Quack is listening on port ${fallbackPort}! Please provide the 'auth_token' generated by DBeaver in your connection's Driver Properties as 'quack.token', or supply it to the assistant.\n\n` +
+              `▶ OPTION 2: Auto-Close in DBeaver:\n` +
+              `   Right-click connection in DBeaver -> Edit Connection -> Connection Settings -> General -> Connection Types -> check "Auto-close connections" (15-30 seconds). DBeaver will automatically release the lock when idle.\n\n` +
+              `▶ OPTION 3: 1-Click Disconnect:\n` +
+              `   Right-click connection in DBeaver -> Disconnect (Ctrl+Alt+Shift+D).`
+            ));
+            return;
+          }
+          reject(new Error(`DuckDB error: ${error.trim()}`));
+          return;
+        }
+
+        try {
+          const trimmed = output.trim();
+          if (!trimmed || trimmed === '[]') {
+            resolve({ columns: [], rows: [], rowCount: 0, executionTime: 0 });
+            return;
+          }
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const columns = Object.keys(parsed[0]);
+            const rows = parsed.map((item: any) => columns.map(col => String(item[col] ?? '')));
+            resolve({ columns, rows, rowCount: rows.length, executionTime: 0 });
+          } else {
+            resolve({ columns: [], rows: [], rowCount: 0, executionTime: 0 });
+          }
+        } catch (err) {
+          reject(new Error(`Failed to parse DuckDB JSON output: ${err}`));
+        }
+      });
+    });
   }
 
   private async executeSQLiteQuery(connection: DBeaverConnection, query: string): Promise<QueryResult> {
@@ -131,7 +282,8 @@ export class DBeaverClient {
         return;
       }
 
-      const proc = spawn('sqlite3', [dbPath, '-header', '-csv'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      // Enforce -safe and -json mode
+      const proc = spawn('sqlite3', ['-safe', '-json', dbPath], { stdio: ['pipe', 'pipe', 'pipe'] });
       
       let output = '';
       let error = '';
@@ -146,23 +298,31 @@ export class DBeaverClient {
       
       proc.on('close', (code) => {
         if (code !== 0) {
-          reject(new Error(`SQLite error: ${error}`));
+          reject(new Error(`SQLite error: ${error.trim()}`));
           return;
         }
         
-        const lines = output.trim().split('\n');
-        if (lines.length === 0) {
-          resolve({ columns: [], rows: [], rowCount: 0, executionTime: 0 });
-          return;
+        try {
+          const trimmed = output.trim();
+          if (!trimmed || trimmed === '[]') {
+            resolve({ columns: [], rows: [], rowCount: 0, executionTime: 0 });
+            return;
+          }
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const columns = Object.keys(parsed[0]);
+            const rows = parsed.map((item: any) => columns.map(col => String(item[col] ?? '')));
+            resolve({ columns, rows, rowCount: rows.length, executionTime: 0 });
+          } else {
+            resolve({ columns: [], rows: [], rowCount: 0, executionTime: 0 });
+          }
+        } catch (err) {
+          reject(new Error(`Failed to parse SQLite JSON output: ${err}`));
         }
-        
-        const columns = lines[0].split(',');
-        const rows = lines.slice(1).map(line => line.split(','));
-        
-        resolve({ columns, rows, rowCount: rows.length, executionTime: 0 });
       });
-      
-      proc.stdin.write(query);
+
+      // Strictly enforce query_only = ON at the SQLite engine level
+      proc.stdin.write('PRAGMA query_only = ON;\n' + query + '\n');
       proc.stdin.end();
     });
   }
@@ -214,6 +374,9 @@ export class DBeaverClient {
     const client = new Client({ host, port, database, user, password, ssl });
     try {
       await client.connect();
+      // Enforce read-only session at PostgreSQL engine level
+      await client.query('SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;');
+      await client.query('SET default_transaction_read_only = on;');
       const res = await client.query(query);
       const columns: string[] = (res.fields || []).map((f: any) => f.name as string);
       const rows: any[][] = (res.rows || []).map((r: any) => columns.map((c: string) => r[c]));
