@@ -57,51 +57,62 @@ export function findDBeaverExecutable(): string {
 }
 
 /**
- * Validate SQL query for basic safety
+ * Validate SQL query for basic safety — READ-ONLY mode.
+ * Only allows SELECT, SHOW, DESCRIBE, EXPLAIN, PRAGMA, and WITH (CTE) queries.
  */
 export function validateQuery(query: string): string | null {
   if (!query || query.trim().length === 0) {
     return 'Query cannot be empty';
   }
 
-  const trimmedQuery = query.trim().toLowerCase();
-  
-  // Block potentially dangerous operations
-  const dangerousPatterns = [
-    /drop\s+database/i,
-    /drop\s+schema/i,
-    /truncate\s+table/i,
-    /delete\s+from\s+\w+\s*$/i, // DELETE without WHERE clause
-    /update\s+\w+\s+set\s+.*\s*$/i, // UPDATE without WHERE clause
-    /grant\s+/i,
-    /revoke\s+/i,
-    /create\s+user/i,
-    /drop\s+user/i,
-    /alter\s+user/i,
-    /shutdown/i,
-    /restart/i
-  ];
-
-  for (const pattern of dangerousPatterns) {
-    if (pattern.test(trimmedQuery)) {
-      return `Potentially dangerous query detected. Query blocked for safety.`;
+  // Strip leading comments (block and line) so they can't hide the real statement
+  let stripped = query.trim();
+  while (true) {
+    if (stripped.startsWith('--')) {
+      const newlineIdx = stripped.indexOf('\n');
+      stripped = newlineIdx === -1 ? '' : stripped.slice(newlineIdx + 1).trim();
+    } else if (stripped.startsWith('/*')) {
+      const endIdx = stripped.indexOf('*/');
+      stripped = endIdx === -1 ? '' : stripped.slice(endIdx + 2).trim();
+    } else {
+      break;
     }
   }
 
-  // Warn about operations that modify data
-  const modifyingPatterns = [
-    /^insert\s+/i,
-    /^update\s+/i,
-    /^delete\s+/i,
-    /^create\s+/i,
-    /^alter\s+/i,
-    /^drop\s+/i
+  const lowerStripped = stripped.toLowerCase();
+
+  // Whitelist: only allow read-only statement types
+  const allowedPrefixes = [
+    'select ',
+    'select\t',
+    'select\n',
+    'show ',
+    'show\t',
+    'describe ',
+    'describe\t',
+    'explain ',
+    'explain\t',
+    'pragma ',
+    'pragma\t',
+    'with ',   // CTEs (WITH ... AS ... SELECT)
+    'with\t',
   ];
 
-  for (const pattern of modifyingPatterns) {
-    if (pattern.test(trimmedQuery)) {
-      // Allow but note - could add confirmation in future
-      break;
+  const isAllowed = allowedPrefixes.some(prefix => lowerStripped.startsWith(prefix));
+
+  if (!isAllowed) {
+    return 'Only read-only queries are allowed (SELECT, SHOW, DESCRIBE, EXPLAIN, PRAGMA, WITH). ' +
+           'INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, and other write operations are blocked.';
+  }
+
+  // Additional safety: block dangerous patterns even inside SELECT (e.g. subquery tricks)
+  const dangerousPatterns = [
+    /;\s*(insert|update|delete|drop|create|alter|truncate|grant|revoke|shutdown|restart)\b/i,
+  ];
+
+  for (const pattern of dangerousPatterns) {
+    if (pattern.test(stripped)) {
+      return 'Multi-statement queries containing write operations are not allowed.';
     }
   }
 
@@ -121,6 +132,33 @@ export function sanitizeConnectionId(connectionId: string): string {
   
   if (sanitized.length === 0) {
     throw new Error('Connection ID contains no valid characters');
+  }
+
+  return sanitized;
+}
+
+/**
+ * Sanitize a SQL identifier (table name, schema name) to prevent SQL injection.
+ * Only allows alphanumeric characters, underscores, dots, and hyphens.
+ * Rejects anything that could break out of a quoted string or inject SQL.
+ */
+export function sanitizeIdentifier(identifier: string): string {
+  if (!identifier || typeof identifier !== 'string') {
+    throw new Error('Identifier must be a non-empty string');
+  }
+
+  // Strip any characters that aren't safe for SQL identifiers
+  const sanitized = identifier.replace(/[^a-zA-Z0-9_.\- ]/g, '');
+
+  if (sanitized.length === 0) {
+    throw new Error(`Identifier "${identifier}" contains no valid characters`);
+  }
+
+  // Block any remaining SQL injection attempts (e.g. keyword-only input)
+  const lower = sanitized.toLowerCase();
+  const sqlKeywords = ['select', 'insert', 'update', 'delete', 'drop', 'alter', 'create', 'truncate', 'grant', 'revoke', 'union'];
+  if (sqlKeywords.includes(lower.trim())) {
+    throw new Error(`Identifier "${identifier}" is a reserved SQL keyword`);
   }
 
   return sanitized;
@@ -171,6 +209,7 @@ export function getTestQuery(driver: string): string {
  * Build schema query based on database driver
  */
 export function buildSchemaQuery(driver: string, tableName: string): string {
+  const safeTableName = sanitizeIdentifier(tableName);
   const driverLower = driver.toLowerCase();
   
   if (driverLower.includes('postgresql') || driverLower.includes('postgres')) {
@@ -184,7 +223,7 @@ export function buildSchemaQuery(driver: string, tableName: string): string {
         numeric_precision,
         numeric_scale
       FROM information_schema.columns 
-      WHERE table_name = '${tableName}'
+      WHERE table_name = '${safeTableName}'
       ORDER BY ordinal_position;
     `;
   } else if (driverLower.includes('mysql')) {
@@ -200,11 +239,11 @@ export function buildSchemaQuery(driver: string, tableName: string): string {
         COLUMN_KEY as column_key,
         EXTRA as extra
       FROM information_schema.COLUMNS 
-      WHERE TABLE_NAME = '${tableName}'
+      WHERE TABLE_NAME = '${safeTableName}'
       ORDER BY ORDINAL_POSITION;
     `;
   } else if (driverLower.includes('sqlite')) {
-    return `PRAGMA table_info(${tableName});`;
+    return `PRAGMA table_info(${safeTableName});`;
   } else if (driverLower.includes('oracle')) {
     return `
       SELECT 
@@ -216,7 +255,7 @@ export function buildSchemaQuery(driver: string, tableName: string): string {
         data_precision,
         data_scale
       FROM user_tab_columns 
-      WHERE table_name = UPPER('${tableName}')
+      WHERE table_name = UPPER('${safeTableName}')
       ORDER BY column_id;
     `;
   } else if (driverLower.includes('mssql') || driverLower.includes('sqlserver')) {
@@ -230,7 +269,7 @@ export function buildSchemaQuery(driver: string, tableName: string): string {
         NUMERIC_PRECISION as numeric_precision,
         NUMERIC_SCALE as numeric_scale
       FROM INFORMATION_SCHEMA.COLUMNS 
-      WHERE TABLE_NAME = '${tableName}'
+      WHERE TABLE_NAME = '${safeTableName}'
       ORDER BY ORDINAL_POSITION;
     `;
   } else {
@@ -242,7 +281,7 @@ export function buildSchemaQuery(driver: string, tableName: string): string {
         is_nullable,
         column_default
       FROM information_schema.columns 
-      WHERE table_name = '${tableName}';
+      WHERE table_name = '${safeTableName}';
     `;
   }
 }
@@ -251,6 +290,7 @@ export function buildSchemaQuery(driver: string, tableName: string): string {
  * Build list tables query based on database driver
  */
 export function buildListTablesQuery(driver: string, schema?: string, includeViews: boolean = false): string {
+  const safeSchema = schema ? sanitizeIdentifier(schema) : undefined;
   const driverLower = driver.toLowerCase();
   
   if (driverLower.includes('postgresql') || driverLower.includes('postgres')) {
@@ -264,7 +304,7 @@ export function buildListTablesQuery(driver: string, schema?: string, includeVie
     `;
     
     if (schema) {
-      query += ` AND table_schema = '${schema}'`;
+      query += ` AND table_schema = '${safeSchema}'`;
     }
     
     if (!includeViews) {
@@ -285,7 +325,7 @@ export function buildListTablesQuery(driver: string, schema?: string, includeVie
     `;
     
     if (schema) {
-      query += ` AND TABLE_SCHEMA = '${schema}'`;
+      query += ` AND TABLE_SCHEMA = '${safeSchema}'`;
     }
     
     if (!includeViews) {
@@ -317,7 +357,7 @@ export function buildListTablesQuery(driver: string, schema?: string, includeVie
     `;
     
     if (schema) {
-      query += ` WHERE owner = UPPER('${schema}')`;
+      query += ` WHERE owner = UPPER('${safeSchema}')`;
     }
     
     if (includeViews) {
@@ -331,7 +371,7 @@ export function buildListTablesQuery(driver: string, schema?: string, includeVie
       `;
       
       if (schema) {
-        query += ` WHERE owner = UPPER('${schema}')`;
+        query += ` WHERE owner = UPPER('${safeSchema}')`;
       }
     }
     
@@ -349,7 +389,7 @@ export function buildListTablesQuery(driver: string, schema?: string, includeVie
     `;
     
     if (schema) {
-      query += ` WHERE table_schema = '${schema}'`;
+      query += ` WHERE table_schema = '${safeSchema}'`;
     }
     
     if (!includeViews) {

@@ -241,82 +241,10 @@ class DBeaverMCPServer {
             required: ['connectionId', 'query'],
           },
         },
-        {
-          name: 'write_query',
-          description: 'Execute INSERT, UPDATE, or DELETE queries on a specific DBeaver connection',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              connectionId: {
-                type: 'string',
-                description: 'The ID or name of the DBeaver connection to use',
-              },
-              query: {
-                type: 'string',
-                description: 'The SQL query to execute (INSERT, UPDATE, DELETE)',
-              },
-            },
-            required: ['connectionId', 'query'],
-          },
-        },
-        {
-          name: 'create_table',
-          description: 'Create new tables in the database',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              connectionId: {
-                type: 'string',
-                description: 'The ID or name of the DBeaver connection',
-              },
-              query: {
-                type: 'string',
-                description: 'CREATE TABLE statement',
-              },
-            },
-            required: ['connectionId', 'query'],
-          },
-        },
-        {
-          name: 'alter_table',
-          description: 'Modify existing table schema (add columns, rename tables, etc.)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              connectionId: {
-                type: 'string',
-                description: 'The ID or name of the DBeaver connection',
-              },
-              query: {
-                type: 'string',
-                description: 'ALTER TABLE statement',
-              },
-            },
-            required: ['connectionId', 'query'],
-          },
-        },
-        {
-          name: 'drop_table',
-          description: 'Remove a table from the database with safety confirmation',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              connectionId: {
-                type: 'string',
-                description: 'The ID or name of the DBeaver connection',
-              },
-              tableName: {
-                type: 'string',
-                description: 'Name of the table to drop',
-              },
-              confirm: {
-                type: 'boolean',
-                description: 'Safety confirmation flag (must be true)',
-              },
-            },
-            required: ['connectionId', 'tableName', 'confirm'],
-          },
-        },
+
+
+
+
         {
           name: 'get_table_schema',
           description: 'Get schema information for a specific table',
@@ -491,31 +419,8 @@ class DBeaverMCPServer {
               maxRows?: number 
             });
 
-          case 'write_query':
-            return await this.handleWriteQuery(args as { 
-              connectionId: string; 
-              query: string; 
-            });
 
-          case 'create_table':
-            return await this.handleCreateTable(args as { 
-              connectionId: string; 
-              query: string; 
-            });
 
-          case 'alter_table':
-            return await this.handleAlterTable(args as { 
-              connectionId: string; 
-              query: string; 
-            });
-
-          case 'drop_table':
-            return await this.handleDropTable(args as { 
-              connectionId: string; 
-              tableName: string; 
-              confirm: boolean 
-            });
-            
           case 'get_table_schema':
             return await this.handleGetTableSchema(args as { 
               connectionId: string; 
@@ -576,6 +481,17 @@ class DBeaverMCPServer {
     });
   }
 
+  private redactConnection(conn: DBeaverConnection): Record<string, any> {
+    const redacted: any = { ...conn };
+    if (redacted.properties) {
+      redacted.properties = { ...redacted.properties };
+      if (redacted.properties.password) {
+        redacted.properties.password = '********';
+      }
+    }
+    return redacted;
+  }
+
   private async handleListConnections(args: { includeDetails?: boolean }) {
     const connections = await this.configParser.parseConnections();
     
@@ -583,7 +499,7 @@ class DBeaverMCPServer {
       return {
         content: [{
           type: 'text' as const,
-          text: JSON.stringify(connections, null, 2),
+          text: JSON.stringify(connections.map(c => this.redactConnection(c)), null, 2),
         }],
       };
     }
@@ -616,7 +532,7 @@ class DBeaverMCPServer {
     return {
       content: [{
         type: 'text' as const,
-        text: JSON.stringify(connection, null, 2),
+        text: JSON.stringify(this.redactConnection(connection), null, 2),
       }],
     };
   }
